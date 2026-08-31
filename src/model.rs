@@ -3,8 +3,8 @@
 use crate::config::ModelConfig;
 use crate::safetensors_loader::{Tensor, load_safetensors};
 use crate::tensor::{
-    apply_repetition_penalty, argmax, dot, matmul_w, rms_norm,
-    sample, softmax, WMat,
+    apply_repetition_penalty, argmax, dot, matmul_w, matmul_w_into, rms_norm,
+    rms_norm_into, sample, softmax, WMat,
 };
 use anyhow::{Result, anyhow, bail};
 use rand::{rngs::StdRng, SeedableRng};
@@ -49,6 +49,25 @@ fn wmat(t: &Tensor) -> Result<WMat> {
     })
 }
 
+/// Optional int8 weight quantization at load (TMG_I8=1): symmetric per-row
+/// scales. Halves model bytes for the DRAM-bound decode path; lm_head and
+/// norms stay higher-precision. Validated against the BF16 path.
+fn wmat_maybe_i8(t: &Tensor, out_features: usize, in_features: usize) -> Result<WMat> {
+    if std::env::var("TMG_I8").map(|v| v == "1").unwrap_or(false) {
+        let f: Vec<f32> = if t.is_bf16() {
+            t.bf16_bits()
+                .iter()
+                .map(|w| f32::from_bits((*w as u32) << 16))
+                .collect()
+        } else {
+            t.as_f32().to_vec()
+        };
+        Ok(WMat::quantize_i8(&f, out_features, in_features))
+    } else {
+        wmat(t)
+    }
+}
+
 /// Norm weights and the embedding table are consumed elementwise as f32.
 fn f32vec(t: &Tensor) -> Result<Vec<f32>> {
     Ok(if t.is_bf16() {
@@ -89,13 +108,13 @@ pub fn load_model(model_path: &Path) -> Result<ModelWeights> {
     for l in 0..config.num_hidden_layers {
         let p = move |suffix: &str| format!("model.layers.{l}.{suffix}");
         layers.push(LayerWeights {
-            wq: wmat(need(&tensors, &p("self_attn.q_proj.weight"))?)?,
-            wk: wmat(need(&tensors, &p("self_attn.k_proj.weight"))?)?,
-            wv: wmat(need(&tensors, &p("self_attn.v_proj.weight"))?)?,
-            wo: wmat(need(&tensors, &p("self_attn.o_proj.weight"))?)?,
-            w_gate: wmat(need(&tensors, &p("mlp.gate_proj.weight"))?)?,
-            w_up: wmat(need(&tensors, &p("mlp.up_proj.weight"))?)?,
-            w_down: wmat(need(&tensors, &p("mlp.down_proj.weight"))?)?,
+            wq: wmat_maybe_i8(need(&tensors, &p("self_attn.q_proj.weight"))?, q_dim, h)?,
+            wk: wmat_maybe_i8(need(&tensors, &p("self_attn.k_proj.weight"))?, kv_dim, h)?,
+            wv: wmat_maybe_i8(need(&tensors, &p("self_attn.v_proj.weight"))?, kv_dim, h)?,
+            wo: wmat_maybe_i8(need(&tensors, &p("self_attn.o_proj.weight"))?, h, q_dim)?,
+            w_gate: wmat_maybe_i8(need(&tensors, &p("mlp.gate_proj.weight"))?, i, h)?,
+            w_up: wmat_maybe_i8(need(&tensors, &p("mlp.up_proj.weight"))?, i, h)?,
+            w_down: wmat_maybe_i8(need(&tensors, &p("mlp.down_proj.weight"))?, h, i)?,
             input_layernorm: f32vec(need(&tensors, &p("input_layernorm.weight"))?)?,
             post_attention_layernorm: f32vec(need(&tensors, &p("post_attention_layernorm.weight"))?)?,
         });
@@ -104,6 +123,9 @@ pub fn load_model(model_path: &Path) -> Result<ModelWeights> {
     let final_norm = f32vec(need(&tensors, "model.norm.weight")?)?;
 
     // lm_head: use dedicated tensor if present, else tie to embeddings
+    // lm_head stays BF16 even in TMG_I8 mode: logits are the most
+    // quant-sensitive output and it costs nothing measurable in decode speed
+    // (lm_head gemv ≈ 20% of streamed bytes, bandwidth-dominated either way).
     let lm_head = match tensors.get("lm_head.weight") {
         Some(t) => wmat(t)?,
         None => WMat::F32(embed.clone()), // tied by convention when lm_head absent
@@ -215,13 +237,53 @@ pub struct Model {
     pub w: ModelWeights,
     /// precomputed RoPE cos/sin tables (shared across layers)
     rope: crate::tensor::Rope,
+    /// reusable decode-path buffers — eliminates ~10 heap allocs per layer
+    /// per token (the decode gemv is DRAM-bound, but allocator churn adds
+    /// latency jitter and touches more cache lines than necessary).
+    scratch: Scratch,
+}
+
+/// Scratch buffers sized for the decode path (single token).
+struct Scratch {
+    x: Vec<f32>,        // residual [h]
+    attn_in: Vec<f32>,  // normed [h]
+    q_all: Vec<f32>,    // [n_q*head_dim]
+    k_all: Vec<f32>,    // [n_kv*head_dim]
+    v_all: Vec<f32>,
+    attn_out: Vec<f32>, // [n_q*head_dim]
+    proj: Vec<f32>,     // [h]
+    mlp_in: Vec<f32>,   // [h]
+    gate: Vec<f32>,     // [i]
+    up: Vec<f32>,       // [i]
+    down: Vec<f32>,     // [h]
+}
+
+impl Scratch {
+    fn new(c: &ModelConfig) -> Self {
+        let h = c.hidden_size;
+        let i = c.intermediate_size;
+        Scratch {
+            x: vec![0.0; h],
+            attn_in: vec![0.0; h],
+            q_all: vec![0.0; c.num_attention_heads * c.head_dim],
+            k_all: vec![0.0; c.num_key_value_heads * c.head_dim],
+            v_all: vec![0.0; c.num_key_value_heads * c.head_dim],
+            attn_out: vec![0.0; c.num_attention_heads * c.head_dim],
+            proj: vec![0.0; h],
+            mlp_in: vec![0.0; h],
+            gate: vec![0.0; i],
+            up: vec![0.0; i],
+            down: vec![0.0; h],
+        }
+    }
 }
 
 impl Model {
     pub fn load(model_path: &Path) -> Result<Self> {
         let w = load_model(model_path)?;
         let rope = crate::tensor::Rope::new(w.config.head_dim, w.config.rope_theta);
-        Ok(Self { w, rope })
+        let scratch = Scratch::new(&w.config);
+        Ok(Self { w, rope, scratch })
     }
 
     /// Run one token through the model, updating the KV cache. Returns logits over vocab.
@@ -235,7 +297,9 @@ impl Model {
 
         // embed
         let emb_start = token as usize * h;
-        let mut x: Vec<f32> = self.w.embed[emb_start..emb_start + h].to_vec();
+        let s = &mut self.scratch;
+        s.x.copy_from_slice(&self.w.embed[emb_start..emb_start + h]);
+        let x = &mut s.x;
 
         let debug = std::env::var("TMG_DEBUG").is_ok();
         if debug {
@@ -245,69 +309,69 @@ impl Model {
             let lw = &self.w.layers[layer_idx];
 
             // --- attention block ---
-            let attn_in = rms_norm(&x, &lw.input_layernorm, c.rms_norm_eps);
+            rms_norm_into(x, &lw.input_layernorm, c.rms_norm_eps, &mut s.attn_in);
 
-            let mut q_all = matmul_w(&attn_in, &lw.wq, n_q * head_dim, h);
-            let mut k_all = matmul_w(&attn_in, &lw.wk, n_kv * head_dim, h);
-            let v_all = matmul_w(&attn_in, &lw.wv, n_kv * head_dim, h);
+            matmul_w_into(&s.attn_in, &lw.wq, n_q * head_dim, h, &mut s.q_all);
+            matmul_w_into(&s.attn_in, &lw.wk, n_kv * head_dim, h, &mut s.k_all);
+            matmul_w_into(&s.attn_in, &lw.wv, n_kv * head_dim, h, &mut s.v_all);
 
             // rope per head (in place on q_all / k_all)
             let pos = cache.len(layer_idx);
             for hd in 0..n_q {
                 let off = hd * head_dim;
-                self.rope.rotate(&mut q_all[off..off + head_dim], pos);
+                self.rope.rotate(&mut s.q_all[off..off + head_dim], pos);
             }
             for hd in 0..n_kv {
                 let off = hd * head_dim;
-                self.rope.rotate(&mut k_all[off..off + head_dim], pos);
+                self.rope.rotate(&mut s.k_all[off..off + head_dim], pos);
             }
             // push ONE timestep: flat kv-head-concatenated k and v
-            cache.push(layer_idx, &k_all, &v_all);
+            cache.push(layer_idx, &s.k_all, &s.v_all);
 
             // causal SDPA with GQA: read directly from flat cache rows, no copies
             let scale = 1.0 / (head_dim as f32).sqrt();
             let kv_dim = n_kv * head_dim;
-            let mut attn_out = vec![0.0f32; n_q * head_dim];
+            s.attn_out.iter_mut().for_each(|v| *v = 0.0);
             let layer_keys = cache.keys_flat(layer_idx);
             let layer_vals = cache.values_flat(layer_idx);
             let n_ctx = cache.len(layer_idx);
             for hd in 0..n_q {
                 let kv_head = hd / group;
-                let s = kv_head * head_dim;
-                let q = &q_all[hd * head_dim..(hd + 1) * head_dim];
-                let o = &mut attn_out[hd * head_dim..(hd + 1) * head_dim];
+                let s2 = kv_head * head_dim;
+                let q = &s.q_all[hd * head_dim..(hd + 1) * head_dim];
+                let o = &mut s.attn_out[hd * head_dim..(hd + 1) * head_dim];
                 // scores
                 let mut scores = Vec::with_capacity(n_ctx);
                 for t in 0..n_ctx {
-                    let krow = &layer_keys[t * kv_dim + s..t * kv_dim + s + head_dim];
+                    let krow = &layer_keys[t * kv_dim + s2..t * kv_dim + s2 + head_dim];
                     scores.push(dot(q, krow) * scale);
                 }
                 let probs = softmax(&scores);
                 for (t, p) in probs.iter().enumerate() {
-                    let v = &layer_vals[t * kv_dim + s..t * kv_dim + s + head_dim];
+                    let v = &layer_vals[t * kv_dim + s2..t * kv_dim + s2 + head_dim];
                     for (oo, vv) in o.iter_mut().zip(v.iter()) {
                         *oo += p * vv;
                     }
                 }
             }
 
-            let attn_proj = matmul_w(&attn_out, &lw.wo, h, n_q * head_dim);
-            for (xi, ai) in x.iter_mut().zip(attn_proj.iter()) {
+            matmul_w_into(&s.attn_out, &lw.wo, h, n_q * head_dim, &mut s.proj);
+            for (xi, ai) in x.iter_mut().zip(s.proj.iter()) {
                 *xi += *ai;
             }
 
             // --- MLP block (fused elementwise: silu(gate) * up in one pass) ---
-            let mlp_in = rms_norm(&x, &lw.post_attention_layernorm, c.rms_norm_eps);
+            rms_norm_into(x, &lw.post_attention_layernorm, c.rms_norm_eps, &mut s.mlp_in);
             if debug {
                 eprintln!("L{} attn_out first8: {:?}", layer_idx, &x[..8]);
             }
-            let mut gate = matmul_w(&mlp_in, &lw.w_gate, c.intermediate_size, h);
-            let up = matmul_w(&mlp_in, &lw.w_up, c.intermediate_size, h);
-            for (g, u) in gate.iter_mut().zip(up.iter()) {
+            matmul_w_into(&s.mlp_in, &lw.w_gate, c.intermediate_size, h, &mut s.gate);
+            matmul_w_into(&s.mlp_in, &lw.w_up, c.intermediate_size, h, &mut s.up);
+            for (g, u) in s.gate.iter_mut().zip(s.up.iter()) {
                 *g = *g / (1.0 + (-*g).exp()) * u;
             }
-            let down = matmul_w(&gate, &lw.w_down, h, c.intermediate_size);
-            for (xi, di) in x.iter_mut().zip(down.iter()) {
+            matmul_w_into(&s.gate, &lw.w_down, h, c.intermediate_size, &mut s.down);
+            for (xi, di) in x.iter_mut().zip(s.down.iter()) {
                 *xi += *di;
             }
             if debug {
@@ -315,8 +379,11 @@ impl Model {
             }
         }
 
-        let normed = rms_norm(&x, &self.w.final_norm, c.rms_norm_eps);
-        let logits = matmul_w(&normed, &self.w.lm_head, c.vocab_size, h);
+        // final norm into attn_in (reuse) + logits (allocated per call — the
+        // caller owns the returned Vec)
+        rms_norm_into(x, &self.w.final_norm, c.rms_norm_eps, &mut s.attn_in);
+        let mut logits = vec![0.0f32; c.vocab_size];
+        matmul_w_into(&s.attn_in, &self.w.lm_head, c.vocab_size, h, &mut logits);
         Ok(logits)
     }
 
@@ -582,6 +649,7 @@ mod tests {
             });
         }
         let rope = crate::tensor::Rope::new(cfg.head_dim, cfg.rope_theta);
+        let scratch = Scratch::new(&cfg);
         let model = Model {
             w: ModelWeights {
                 embed: tensors.get("model.embed_tokens.weight").unwrap().as_f32().to_vec(),
@@ -591,6 +659,7 @@ mod tests {
                 config: cfg,
             },
             rope,
+            scratch,
         };
         let mut model = model;
         let mut cache = KvCache::new(2);

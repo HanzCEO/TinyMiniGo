@@ -25,6 +25,12 @@ fn main() {
 fn run() -> Result<()> {
     let args = Args::parse();
 
+    if let Ok(t) = std::env::var("TMG_THREADS") {
+        if let Ok(n) = t.parse::<usize>() {
+            tensor::set_num_threads(n);
+        }
+    }
+
     let model_path = Path::new(&args.model);
     if !model_path.exists() {
         anyhow::bail!("model file not found: {}", model_path.display());
