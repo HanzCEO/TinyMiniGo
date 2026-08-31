@@ -3,8 +3,8 @@
 use crate::config::ModelConfig;
 use crate::safetensors_loader::{Tensor, load_safetensors};
 use crate::tensor::{
-    apply_repetition_penalty, argmax, attention_row, matmul, mul_elem, rms_norm, rope_rotate,
-    sample, silu, softmax,
+    apply_repetition_penalty, argmax, dot, matmul_w, rms_norm,
+    sample, softmax, WMat,
 };
 use anyhow::{Result, anyhow, bail};
 use rand::{rngs::StdRng, SeedableRng};
@@ -16,22 +16,22 @@ use std::path::Path;
 // ---------------------------------------------------------------------------
 
 pub struct LayerWeights {
-    pub wq: Vec<f32>, // [n_heads*head_dim, hidden]
-    pub wk: Vec<f32>,
-    pub wv: Vec<f32>,
-    pub wo: Vec<f32>,
-    pub w_gate: Vec<f32>, // [intermediate, hidden]
-    pub w_up: Vec<f32>,
-    pub w_down: Vec<f32>, // [hidden, intermediate]
+    pub wq: WMat, // [n_heads*head_dim, hidden]
+    pub wk: WMat,
+    pub wv: WMat,
+    pub wo: WMat,
+    pub w_gate: WMat, // [intermediate, hidden]
+    pub w_up: WMat,
+    pub w_down: WMat, // [hidden, intermediate]
     pub input_layernorm: Vec<f32>,
     pub post_attention_layernorm: Vec<f32>,
 }
 
 pub struct ModelWeights {
-    pub embed: Vec<f32>, // [vocab, hidden]
+    pub embed: Vec<f32>, // [vocab, hidden] (f32 gather table)
     pub layers: Vec<LayerWeights>,
     pub final_norm: Vec<f32>,
-    pub lm_head: Vec<f32>, // [vocab, hidden]
+    pub lm_head: WMat, // [vocab, hidden]
     pub config: ModelConfig,
 }
 
@@ -41,8 +41,21 @@ fn need<'a>(tensors: &'a HashMap<String, Tensor>, name: &str) -> Result<&'a Tens
         .ok_or_else(|| anyhow!("missing tensor `{name}` in safetensors file"))
 }
 
-fn flat(t: &Tensor) -> Result<Vec<f32>> {
-    Ok(t.as_f32().to_vec())
+fn wmat(t: &Tensor) -> Result<WMat> {
+    Ok(if t.is_bf16() {
+        WMat::BF16(t.bf16_bits().to_vec())
+    } else {
+        WMat::F32(t.as_f32().to_vec())
+    })
+}
+
+/// Norm weights and the embedding table are consumed elementwise as f32.
+fn f32vec(t: &Tensor) -> Result<Vec<f32>> {
+    Ok(if t.is_bf16() {
+        t.bf16_bits().iter().map(|w| f32::from_bits((*w as u32) << 16)).collect()
+    } else {
+        t.as_f32().to_vec()
+    })
 }
 
 pub fn load_model(model_path: &Path) -> Result<ModelWeights> {
@@ -56,7 +69,14 @@ pub fn load_model(model_path: &Path) -> Result<ModelWeights> {
     let q_dim = config.num_attention_heads * config.head_dim;
     let kv_dim = config.num_key_value_heads * config.head_dim;
 
-    let embed = flat(need(&tensors, "model.embed_tokens.weight")?)?;
+    let embed = {
+        let t = need(&tensors, "model.embed_tokens.weight")?;
+        if t.is_bf16() {
+            t.bf16_bits().iter().map(|w| f32::from_bits((*w as u32) << 16)).collect()
+        } else {
+            t.as_f32().to_vec()
+        }
+    };
     if embed.len() != config.vocab_size * h {
         bail!(
             "embed size {} != vocab*hidden {}",
@@ -69,24 +89,24 @@ pub fn load_model(model_path: &Path) -> Result<ModelWeights> {
     for l in 0..config.num_hidden_layers {
         let p = move |suffix: &str| format!("model.layers.{l}.{suffix}");
         layers.push(LayerWeights {
-            wq: flat(need(&tensors, &p("self_attn.q_proj.weight"))?)?,
-            wk: flat(need(&tensors, &p("self_attn.k_proj.weight"))?)?,
-            wv: flat(need(&tensors, &p("self_attn.v_proj.weight"))?)?,
-            wo: flat(need(&tensors, &p("self_attn.o_proj.weight"))?)?,
-            w_gate: flat(need(&tensors, &p("mlp.gate_proj.weight"))?)?,
-            w_up: flat(need(&tensors, &p("mlp.up_proj.weight"))?)?,
-            w_down: flat(need(&tensors, &p("mlp.down_proj.weight"))?)?,
-            input_layernorm: flat(need(&tensors, &p("input_layernorm.weight"))?)?,
-            post_attention_layernorm: flat(need(&tensors, &p("post_attention_layernorm.weight"))?)?,
+            wq: wmat(need(&tensors, &p("self_attn.q_proj.weight"))?)?,
+            wk: wmat(need(&tensors, &p("self_attn.k_proj.weight"))?)?,
+            wv: wmat(need(&tensors, &p("self_attn.v_proj.weight"))?)?,
+            wo: wmat(need(&tensors, &p("self_attn.o_proj.weight"))?)?,
+            w_gate: wmat(need(&tensors, &p("mlp.gate_proj.weight"))?)?,
+            w_up: wmat(need(&tensors, &p("mlp.up_proj.weight"))?)?,
+            w_down: wmat(need(&tensors, &p("mlp.down_proj.weight"))?)?,
+            input_layernorm: f32vec(need(&tensors, &p("input_layernorm.weight"))?)?,
+            post_attention_layernorm: f32vec(need(&tensors, &p("post_attention_layernorm.weight"))?)?,
         });
     }
 
-    let final_norm = flat(need(&tensors, "model.norm.weight")?)?;
+    let final_norm = f32vec(need(&tensors, "model.norm.weight")?)?;
 
     // lm_head: use dedicated tensor if present, else tie to embeddings
     let lm_head = match tensors.get("lm_head.weight") {
-        Some(t) => flat(t)?,
-        None => embed.clone(), // tied by convention when lm_head absent
+        Some(t) => wmat(t)?,
+        None => WMat::F32(embed.clone()), // tied by convention when lm_head absent
     };
     let _ = (h, i, q_dim, kv_dim);
 
@@ -104,10 +124,13 @@ pub fn load_model(model_path: &Path) -> Result<ModelWeights> {
 // ---------------------------------------------------------------------------
 
 pub struct KvCache {
-    /// per layer, per timestep: flat concatenated key vector [n_kv * head_dim]
-    pub keys: Vec<Vec<Vec<f32>>>,
-    /// per layer, per timestep: flat concatenated value vector [n_kv * head_dim]
-    pub values: Vec<Vec<Vec<f32>>>,
+    /// per layer: flat [pos * kv_dim] buffer of concatenated KV-head keys
+    pub keys: Vec<Vec<f32>>,
+    /// per layer: flat [pos * kv_dim] buffer of concatenated KV-head values
+    pub values: Vec<Vec<f32>>,
+    /// per layer: number of timesteps stored
+    lens: Vec<usize>,
+    kv_dim: usize,
     #[allow(dead_code)] // kept for reset() bookkeeping
     num_layers: usize,
 }
@@ -117,23 +140,61 @@ impl KvCache {
         Self {
             keys: vec![Vec::new(); num_layers],
             values: vec![Vec::new(); num_layers],
+            lens: vec![0; num_layers],
+            kv_dim: 0,
             num_layers,
         }
     }
 
+    /// Configure the per-layer row width (must be called before first push).
+    pub fn set_kv_dim(&mut self, kv_dim: usize) {
+        self.kv_dim = kv_dim;
+    }
+
+    #[allow(dead_code)] // part of the cache API
+    pub fn kv_dim(&self) -> usize {
+        self.kv_dim
+    }
+
     pub fn len(&self, layer: usize) -> usize {
-        self.keys[layer].len()
+        self.lens[layer]
     }
 
     /// Push one timestep: k/v are flat concatenated across all KV heads.
-    pub fn push(&mut self, layer: usize, k: Vec<f32>, v: Vec<f32>) {
-        self.keys[layer].push(k);
-        self.values[layer].push(v);
+    pub fn push(&mut self, layer: usize, k: &[f32], v: &[f32]) {
+        assert_eq!(k.len(), self.kv_dim, "kv row width mismatch");
+        self.keys[layer].extend_from_slice(k);
+        self.values[layer].extend_from_slice(v);
+        self.lens[layer] += 1;
+    }
+
+    /// Key row for timestep `t` of `layer` (flat slice of kv_dim floats).
+    #[allow(dead_code)] // part of the cache API
+    pub fn key_row(&self, layer: usize, t: usize) -> &[f32] {
+        let s = t * self.kv_dim;
+        &self.keys[layer][s..s + self.kv_dim]
+    }
+
+    /// Value row for timestep `t` of `layer`.
+    #[allow(dead_code)] // part of the cache API
+    pub fn value_row(&self, layer: usize, t: usize) -> &[f32] {
+        let s = t * self.kv_dim;
+        &self.values[layer][s..s + self.kv_dim]
+    }
+
+    /// All key rows for `layer` as one contiguous [pos, kv_dim] slice.
+    pub fn keys_flat(&self, layer: usize) -> &[f32] {
+        &self.keys[layer]
+    }
+
+    /// All value rows for `layer` as one contiguous [pos, kv_dim] slice.
+    pub fn values_flat(&self, layer: usize) -> &[f32] {
+        &self.values[layer]
     }
 
     #[allow(dead_code)] // used by tests; part of the cache API
     pub fn total_len(&self) -> usize {
-        self.keys[0].len()
+        self.lens.first().copied().unwrap_or(0)
     }
 
     #[allow(dead_code)] // part of the cache API for multi-turn reuse
@@ -141,6 +202,7 @@ impl KvCache {
         for l in 0..self.num_layers {
             self.keys[l].clear();
             self.values[l].clear();
+            self.lens[l] = 0;
         }
     }
 }
@@ -151,13 +213,15 @@ impl KvCache {
 
 pub struct Model {
     pub w: ModelWeights,
+    /// precomputed RoPE cos/sin tables (shared across layers)
+    rope: crate::tensor::Rope,
 }
 
 impl Model {
     pub fn load(model_path: &Path) -> Result<Self> {
-        Ok(Self {
-            w: load_model(model_path)?,
-        })
+        let w = load_model(model_path)?;
+        let rope = crate::tensor::Rope::new(w.config.head_dim, w.config.rope_theta);
+        Ok(Self { w, rope })
     }
 
     /// Run one token through the model, updating the KV cache. Returns logits over vocab.
@@ -183,58 +247,66 @@ impl Model {
             // --- attention block ---
             let attn_in = rms_norm(&x, &lw.input_layernorm, c.rms_norm_eps);
 
-            let q_all = matmul(&attn_in, &lw.wq, n_q * head_dim, h);
-            let k_all = matmul(&attn_in, &lw.wk, n_kv * head_dim, h);
-            let v_all = matmul(&attn_in, &lw.wv, n_kv * head_dim, h);
+            let mut q_all = matmul_w(&attn_in, &lw.wq, n_q * head_dim, h);
+            let mut k_all = matmul_w(&attn_in, &lw.wk, n_kv * head_dim, h);
+            let v_all = matmul_w(&attn_in, &lw.wv, n_kv * head_dim, h);
 
-            // rope per head
+            // rope per head (in place on q_all / k_all)
             let pos = cache.len(layer_idx);
-            let mut q_heads: Vec<Vec<f32>> = Vec::with_capacity(n_q);
             for hd in 0..n_q {
-                let mut qv = q_all[hd * head_dim..(hd + 1) * head_dim].to_vec();
-                rope_rotate(&mut qv, pos, c.rope_theta);
-                q_heads.push(qv);
+                let off = hd * head_dim;
+                self.rope.rotate(&mut q_all[off..off + head_dim], pos);
             }
-            let mut k_flat = k_all.clone();
             for hd in 0..n_kv {
-                let kv = &mut k_flat[hd * head_dim..(hd + 1) * head_dim];
-                rope_rotate(kv, pos, c.rope_theta);
+                let off = hd * head_dim;
+                self.rope.rotate(&mut k_all[off..off + head_dim], pos);
             }
             // push ONE timestep: flat kv-head-concatenated k and v
-            let v_flat = v_all.clone();
-            cache.push(layer_idx, k_flat, v_flat);
+            cache.push(layer_idx, &k_all, &v_all);
 
-            // causal SDPA with GQA: query head hd slices its kv head from each timestep
+            // causal SDPA with GQA: read directly from flat cache rows, no copies
             let scale = 1.0 / (head_dim as f32).sqrt();
+            let kv_dim = n_kv * head_dim;
             let mut attn_out = vec![0.0f32; n_q * head_dim];
+            let layer_keys = cache.keys_flat(layer_idx);
+            let layer_vals = cache.values_flat(layer_idx);
+            let n_ctx = cache.len(layer_idx);
             for hd in 0..n_q {
                 let kv_head = hd / group;
-                let mut keys: Vec<Vec<f32>> = Vec::with_capacity(cache.len(layer_idx));
-                let mut vals: Vec<Vec<f32>> = Vec::with_capacity(cache.len(layer_idx));
-                for t in 0..cache.len(layer_idx) {
-                    let s = kv_head * head_dim;
-                    keys.push(cache.keys[layer_idx][t][s..s + head_dim].to_vec());
-                    vals.push(cache.values[layer_idx][t][s..s + head_dim].to_vec());
+                let s = kv_head * head_dim;
+                let q = &q_all[hd * head_dim..(hd + 1) * head_dim];
+                let o = &mut attn_out[hd * head_dim..(hd + 1) * head_dim];
+                // scores
+                let mut scores = Vec::with_capacity(n_ctx);
+                for t in 0..n_ctx {
+                    let krow = &layer_keys[t * kv_dim + s..t * kv_dim + s + head_dim];
+                    scores.push(dot(q, krow) * scale);
                 }
-                let out = attention_row(&q_heads[hd], &keys, &vals, keys.len(), scale);
-                attn_out[hd * head_dim..(hd + 1) * head_dim].copy_from_slice(&out);
+                let probs = softmax(&scores);
+                for (t, p) in probs.iter().enumerate() {
+                    let v = &layer_vals[t * kv_dim + s..t * kv_dim + s + head_dim];
+                    for (oo, vv) in o.iter_mut().zip(v.iter()) {
+                        *oo += p * vv;
+                    }
+                }
             }
 
-            let attn_proj = matmul(&attn_out, &lw.wo, h, n_q * head_dim);
+            let attn_proj = matmul_w(&attn_out, &lw.wo, h, n_q * head_dim);
             for (xi, ai) in x.iter_mut().zip(attn_proj.iter()) {
                 *xi += *ai;
             }
 
-            // --- MLP block ---
+            // --- MLP block (fused elementwise: silu(gate) * up in one pass) ---
             let mlp_in = rms_norm(&x, &lw.post_attention_layernorm, c.rms_norm_eps);
             if debug {
                 eprintln!("L{} attn_out first8: {:?}", layer_idx, &x[..8]);
             }
-            let gate = matmul(&mlp_in, &lw.w_gate, c.intermediate_size, h);
-            let up = matmul(&mlp_in, &lw.w_up, c.intermediate_size, h);
-            let act = silu(&gate);
-            let hidden = mul_elem(&act, &up);
-            let down = matmul(&hidden, &lw.w_down, h, c.intermediate_size);
+            let mut gate = matmul_w(&mlp_in, &lw.w_gate, c.intermediate_size, h);
+            let up = matmul_w(&mlp_in, &lw.w_up, c.intermediate_size, h);
+            for (g, u) in gate.iter_mut().zip(up.iter()) {
+                *g = *g / (1.0 + (-*g).exp()) * u;
+            }
+            let down = matmul_w(&gate, &lw.w_down, h, c.intermediate_size);
             for (xi, di) in x.iter_mut().zip(down.iter()) {
                 *xi += *di;
             }
@@ -244,20 +316,106 @@ impl Model {
         }
 
         let normed = rms_norm(&x, &self.w.final_norm, c.rms_norm_eps);
-        let logits = matmul(&normed, &self.w.lm_head, c.vocab_size, h);
+        let logits = matmul_w(&normed, &self.w.lm_head, c.vocab_size, h);
         Ok(logits)
     }
 
     /// Prefill a full prompt, return logits for the last position.
     pub fn prefill(&mut self, tokens: &[u32], cache: &mut KvCache) -> Result<Vec<f32>> {
-        let mut last_logits: Vec<f32> = Vec::new();
-        for &t in tokens {
-            last_logits = self.forward_token(t, cache)?;
-        }
-        if last_logits.is_empty() {
+        if tokens.is_empty() {
             bail!("empty prompt");
         }
-        Ok(last_logits)
+        self.forward_seq(tokens, cache)
+    }
+
+    /// Run a sequence of tokens (batched prefill) starting at the current cache position,
+    /// appending all K/V to the cache. Returns logits for the LAST token.
+    pub fn forward_seq(&mut self, tokens: &[u32], cache: &mut KvCache) -> Result<Vec<f32>> {
+        use crate::tensor::{attention_batch, matmul_batch_w, rms_norm_batch};
+        let c = &self.w.config;
+        let h = c.hidden_size;
+        let head_dim = c.head_dim;
+        let n_q = c.num_attention_heads;
+        let n_kv = c.num_key_value_heads;
+        let _group = n_q / n_kv;
+        let t = tokens.len();
+        let start_pos = cache.len(0);
+
+        // embed: gather rows into [T, h]
+        let mut x: Vec<f32> = Vec::with_capacity(t * h);
+        for &tok in tokens {
+            let s = tok as usize * h;
+            x.extend_from_slice(&self.w.embed[s..s + h]);
+        }
+
+        for layer_idx in 0..c.num_hidden_layers {
+            let lw = &self.w.layers[layer_idx];
+
+            // --- attention block ---
+            let mut normed = x.clone();
+            rms_norm_batch(&mut normed, &lw.input_layernorm, c.rms_norm_eps, h);
+
+            let mut q_all = matmul_batch_w(&normed, &lw.wq, n_q * head_dim, h, t);
+            let mut k_all = matmul_batch_w(&normed, &lw.wk, n_kv * head_dim, h, t);
+            let v_all = matmul_batch_w(&normed, &lw.wv, n_kv * head_dim, h, t);
+
+            // rope per head per token
+            for ti in 0..t {
+                let pos = start_pos + ti;
+                for hd in 0..n_q {
+                    let off = ti * n_q * head_dim + hd * head_dim;
+                    self.rope.rotate(&mut q_all[off..off + head_dim], pos);
+                }
+                for hd in 0..n_kv {
+                    let off = ti * n_kv * head_dim + hd * head_dim;
+                    self.rope.rotate(&mut k_all[off..off + head_dim], pos);
+                }
+            }
+
+            // append all T timesteps to the flat cache
+            for ti in 0..t {
+                cache.push(
+                    layer_idx,
+                    &k_all[ti * n_kv * head_dim..(ti + 1) * n_kv * head_dim],
+                    &v_all[ti * n_kv * head_dim..(ti + 1) * n_kv * head_dim],
+                );
+            }
+
+            // causal attention over the flat cache (positions 0..start_pos+T)
+            let attn_out = attention_batch(
+                &q_all,
+                cache.keys_flat(layer_idx),
+                cache.values_flat(layer_idx),
+                n_q,
+                n_kv,
+                head_dim,
+                start_pos,
+            );
+
+            let attn_proj = matmul_batch_w(&attn_out, &lw.wo, h, n_q * head_dim, t);
+            for (xi, ai) in x.iter_mut().zip(attn_proj.iter()) {
+                *xi += *ai;
+            }
+
+            // --- MLP block ---
+            let mut normed = x.clone();
+            rms_norm_batch(&mut normed, &lw.post_attention_layernorm, c.rms_norm_eps, h);
+            let mut gate = matmul_batch_w(&normed, &lw.w_gate, c.intermediate_size, h, t);
+            let up = matmul_batch_w(&normed, &lw.w_up, c.intermediate_size, h, t);
+            // fused silu(gate) * up
+            for i in 0..t * c.intermediate_size {
+                let g = gate[i];
+                gate[i] = g / (1.0 + (-g).exp()) * up[i];
+            }
+            let down = matmul_batch_w(&gate, &lw.w_down, h, c.intermediate_size, t);
+            for (xi, di) in x.iter_mut().zip(down.iter()) {
+                *xi += *di;
+            }
+        }
+
+        rms_norm_batch(&mut x[(t - 1) * h..], &self.w.final_norm, c.rms_norm_eps, h);
+        let last = &x[(t - 1) * h..];
+        Ok(matmul_w(last, &self.w.lm_head, c.vocab_size, h))
     }
 }
 
@@ -277,6 +435,8 @@ pub struct GenParams {
 pub struct GenOutput {
     pub tokens: Vec<u32>,
     pub logits_first_step: Vec<f32>,
+    /// wall time of the prefill phase (prompt ingestion)
+    pub prefill_secs: f32,
 }
 
 /// Greedy/sampling generation with stop conditions (EOS, max tokens).
@@ -287,7 +447,10 @@ pub fn generate(
     mut on_token: impl FnMut(u32),
 ) -> Result<GenOutput> {
     let mut cache = KvCache::new(model.w.config.num_hidden_layers);
+    cache.set_kv_dim(model.w.config.num_key_value_heads * model.w.config.head_dim);
+    let t0 = std::time::Instant::now();
     let mut logits = model.prefill(prompt_tokens, &mut cache)?;
+    let prefill_secs = t0.elapsed().as_secs_f32();
 
     let first_logits = logits.clone();
     let mut generated: Vec<u32> = Vec::with_capacity(params.max_tokens);
@@ -324,6 +487,7 @@ pub fn generate(
     Ok(GenOutput {
         tokens: generated,
         logits_first_step: first_logits,
+        prefill_secs,
     })
 }
 
@@ -394,7 +558,14 @@ mod tests {
             eos_token_ids: vec![9],
             bos_token_id: 0,
         };
-        let get = |n: &str| tensors.get(n).unwrap().as_f32().to_vec();
+        let get = |n: &str| -> WMat {
+            let t = tensors.get(n).unwrap();
+            if t.is_bf16() {
+                crate::tensor::WMat::BF16(t.bf16_bits().to_vec())
+            } else {
+                crate::tensor::WMat::F32(t.as_f32().to_vec())
+            }
+        };
         let mut layers = Vec::new();
         for l in 0..2 {
             let p = move |s: &str| format!("model.layers.{l}.{s}");
@@ -406,21 +577,24 @@ mod tests {
                 w_gate: get(&p("mlp.gate_proj.weight")),
                 w_up: get(&p("mlp.up_proj.weight")),
                 w_down: get(&p("mlp.down_proj.weight")),
-                input_layernorm: get(&p("input_layernorm.weight")),
-                post_attention_layernorm: get(&p("post_attention_layernorm.weight")),
+                input_layernorm: tensors.get(&p("input_layernorm.weight")).unwrap().as_f32().to_vec(),
+                post_attention_layernorm: tensors.get(&p("post_attention_layernorm.weight")).unwrap().as_f32().to_vec(),
             });
         }
+        let rope = crate::tensor::Rope::new(cfg.head_dim, cfg.rope_theta);
         let model = Model {
             w: ModelWeights {
-                embed: get("model.embed_tokens.weight"),
+                embed: tensors.get("model.embed_tokens.weight").unwrap().as_f32().to_vec(),
                 layers,
-                final_norm: get("model.norm.weight"),
+                final_norm: tensors.get("model.norm.weight").unwrap().as_f32().to_vec(),
                 lm_head: get("lm_head.weight"),
                 config: cfg,
             },
+            rope,
         };
         let mut model = model;
         let mut cache = KvCache::new(2);
+        cache.set_kv_dim(model.w.config.num_key_value_heads * model.w.config.head_dim);
         let logits = model.forward_token(0, &mut cache).unwrap();
         assert_eq!(logits.len(), 10);
         // second token: KV cache grows
@@ -435,12 +609,14 @@ mod tests {
     #[test]
     fn kv_cache_push_and_len() {
         let mut cache = KvCache::new(3);
+        cache.set_kv_dim(2);
         assert_eq!(cache.total_len(), 0);
-        cache.push(1, vec![0.1, 0.2], vec![0.3, 0.4]);
+        cache.push(1, &[0.1, 0.2], &[0.3, 0.4]);
         assert_eq!(cache.len(1), 1);
         assert_eq!(cache.len(0), 0);
-        assert_eq!(cache.total_len(), 0); // layer 0 empty -> total reflects layer 0
-        cache.push(0, vec![0.1], vec![0.2]);
+        assert_eq!(cache.total_len(), 0); // total_len reports layer 0
+        cache.push(0, &[0.1, 0.2], &[0.3, 0.4]);
+        assert_eq!(cache.len(0), 1);
         assert_eq!(cache.total_len(), 1);
         cache.reset();
         assert_eq!(cache.total_len(), 0);

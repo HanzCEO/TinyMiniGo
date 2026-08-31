@@ -23,19 +23,20 @@ fn layer0_o_proj_matches_reference() {
 
     let x0: Vec<f32> = m.w.embed[0..h].to_vec();
     let ln1 = tensor::rms_norm(&x0, &lw.input_layernorm, c.rms_norm_eps);
-    let q = tensor::matmul(&ln1, &lw.wq, c.num_attention_heads * c.head_dim, h);
-    let k = tensor::matmul(&ln1, &lw.wk, c.num_key_value_heads * c.head_dim, h);
-    let v = tensor::matmul(&ln1, &lw.wv, c.num_key_value_heads * c.head_dim, h);
+    let q = tensor::matmul_w(&ln1, &lw.wq, c.num_attention_heads * c.head_dim, h);
+    let k = tensor::matmul_w(&ln1, &lw.wk, c.num_key_value_heads * c.head_dim, h);
+    let v = tensor::matmul_w(&ln1, &lw.wv, c.num_key_value_heads * c.head_dim, h);
 
     let n_q = c.num_attention_heads;
     let n_kv = c.num_key_value_heads;
     let mut cache = KvCache::new(1);
+    cache.set_kv_dim(n_kv * c.head_dim);
     let mut k_flat = k.clone();
     for hd in 0..n_kv {
         let kv = &mut k_flat[hd * c.head_dim..(hd + 1) * c.head_dim];
         tensor::rope_rotate(kv, 0, c.rope_theta);
     }
-    cache.push(0, k_flat, v);
+    cache.push(0, &k_flat, &v);
 
     let scale = 1.0 / (c.head_dim as f32).sqrt();
     let group = n_q / n_kv;
@@ -45,18 +46,17 @@ fn layer0_o_proj_matches_reference() {
         tensor::rope_rotate(&mut qv, 0, c.rope_theta);
         let kv_head = hd / group;
         let s = kv_head * c.head_dim;
-        let keys: Vec<Vec<f32>> = cache.keys[0]
-            .iter()
-            .map(|k| k[s..s + c.head_dim].to_vec())
+        let kv_dim = n_kv * c.head_dim;
+        let keys: Vec<Vec<f32>> = (0..cache.len(0))
+            .map(|t| cache.keys[0][t * kv_dim + s..t * kv_dim + s + c.head_dim].to_vec())
             .collect();
-        let vals: Vec<Vec<f32>> = cache.values[0]
-            .iter()
-            .map(|vv| vv[s..s + c.head_dim].to_vec())
+        let vals: Vec<Vec<f32>> = (0..cache.len(0))
+            .map(|t| cache.values[0][t * kv_dim + s..t * kv_dim + s + c.head_dim].to_vec())
             .collect();
         let out = tensor::attention_row(&qv, &keys, &vals, keys.len(), scale);
         attn[hd * c.head_dim..(hd + 1) * c.head_dim].copy_from_slice(&out);
     }
-    let o = tensor::matmul(&attn, &lw.wo, h, n_q * c.head_dim);
+    let o = tensor::matmul_w(&attn, &lw.wo, h, n_q * c.head_dim);
 
     // HF reference (scripts/hf_layer_debug.py): o_out first 8
     let hf = [0.363_092_1f32, -0.230_118_9, 0.818_211, 0.340_060_1,
@@ -78,6 +78,7 @@ fn full_prompt_first_step_logits_match_hf() {
     }
     let mut m = Model::load(Path::new("/tmp/tinyminicpm5/model.safetensors")).unwrap();
     let mut cache = KvCache::new(m.w.config.num_hidden_layers);
+    cache.set_kv_dim(m.w.config.num_key_value_heads * m.w.config.head_dim);
     // Prompt ids from HF apply_chat_template for "What is the capital of France?"
     let ids: [u32; 16] = [0, 130072, 8448, 220, 2928, 357, 285, 4894, 304, 6918, 52, 130073, 220, 130072, 130071, 220];
     let mut logits = vec![];

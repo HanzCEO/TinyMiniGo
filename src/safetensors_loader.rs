@@ -6,7 +6,9 @@ use anyhow::{bail, Context, Result};
 use safetensors::tensor::SafeTensors;
 use safetensors::tensor::Dtype as DataType;
 
-/// A tensor loaded into memory, converted to f32 when needed.
+/// A tensor loaded into memory.
+/// BF16 tensors keep their raw bits (dequantized in-register in the gemm kernels)
+/// to halve memory footprint and bandwidth; F16/F32 are converted to f32 at load.
 #[derive(Clone)]
 pub struct Tensor {
     #[allow(dead_code)] // kept alongside data for shape-aware consumers
@@ -17,15 +19,27 @@ pub struct Tensor {
 #[derive(Clone)]
 pub enum TensorData {
     F32(Vec<f32>),
-    F16(Vec<f32>), // converted from f16 at load
-    BF16(Vec<f32>), // converted from bf16 at load
+    F16(Vec<f32>),      // converted from f16 at load
+    BF16Raw(Vec<u16>),  // raw bf16 bits, dequantized in the math kernels
 }
 
 impl Tensor {
     pub fn as_f32(&self) -> &[f32] {
         match &self.data {
-            TensorData::F32(v) | TensorData::F16(v) | TensorData::BF16(v) => v,
+            TensorData::F32(v) | TensorData::F16(v) => v,
+            TensorData::BF16Raw(_) => panic!("as_f32 on raw BF16 tensor; use bf16_bits()"),
         }
+    }
+
+    pub fn bf16_bits(&self) -> &[u16] {
+        match &self.data {
+            TensorData::BF16Raw(v) => v,
+            _ => panic!("bf16_bits on non-BF16 tensor"),
+        }
+    }
+
+    pub fn is_bf16(&self) -> bool {
+        matches!(self.data, TensorData::BF16Raw(_))
     }
 }
 
@@ -73,12 +87,12 @@ pub fn load_safetensors(path: &Path) -> Result<HashMap<String, Tensor>> {
                 TensorData::F16(raw)
             }
             DataType::BF16 => {
-                let raw: Vec<f32> = view
+                let raw: Vec<u16> = view
                     .data()
                     .chunks_exact(2)
-                    .map(|c| bf16_to_f32(u16::from_le_bytes(c.try_into().unwrap())))
+                    .map(|c| u16::from_le_bytes(c.try_into().unwrap()))
                     .collect();
-                TensorData::BF16(raw)
+                TensorData::BF16Raw(raw)
             }
             other => bail!(
                 "unsupported dtype {:?} for tensor {} in {}",
@@ -118,6 +132,7 @@ pub fn f16_to_f32(h: u16) -> f32 {
     f32::from_bits(bits)
 }
 
+#[allow(dead_code)] // kept for reference/tests
 pub fn bf16_to_f32(b: u16) -> f32 {
     f32::from_bits((b as u32) << 16)
 }
@@ -166,6 +181,7 @@ mod tests {
         std::fs::write(&path, &bytes).unwrap();
         let tensors = load_safetensors(&path).unwrap();
         let t = tensors.get("b").unwrap();
-        assert_eq!(t.as_f32(), &[1.0, -2.0]);
+        assert!(t.is_bf16());
+        assert_eq!(t.bf16_bits(), &[0x3f80, 0xc000]);
     }
 }

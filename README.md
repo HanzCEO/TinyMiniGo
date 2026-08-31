@@ -56,9 +56,25 @@ MiniCPM5 = Llama-style decoder:
 - **GQA attention**: `num_attention_heads` query heads share `num_key_value_heads` KV heads; RoPE uses the HF `rotate_half` (half-split) layout with `rope_theta` (may live in `rope_parameters.rope_theta`)
 - **SwiGLU MLP**: `down(silu(gate(x)) * up(x))`
 - **Weights**: `model.embed_tokens.weight`, per-layer `self_attn.{q,k,v,o}_proj.weight`, `mlp.{gate,up,down}_proj.weight`, `{input,post_attention}_layernorm.weight`, `model.norm.weight`, `lm_head.weight` (falls back to tied embeddings when absent). HF `nn.Linear` convention `y = xW^T` with weights stored `[out, in]`.
-- **KV cache**: per layer, per timestep; incremental decode with causal masking
+- **KV cache**: per layer, one contiguous flat buffer `[pos, n_kv*head_dim]`; incremental decode with causal masking, zero per-token allocations
 
-All math is computed in `f32` (weights are converted from BF16/F16 at load).
+## Performance
+
+Kernels are hand-rolled AVX2+FMA (runtime-detected, scalar fallback) with std-thread
+parallelism over output rows: batched prefill gemm uses all cores, decode gemv uses
+core count / 4 (decode is DRAM-bandwidth-bound — more threads measurably hurt).
+Weights stay in raw BF16 and are dequantized in-register during the dot products,
+halving memory traffic; the conversion is bit-exact.
+
+On a Ryzen 7 5800H (MiniCPM5-1B, greedy, `scripts/bench.sh 64`):
+
+| phase  | before | after | speedup |
+|--------|-------:|------:|--------:|
+| prefill | 1.4 tok/s | ~62 tok/s | ~44× |
+| decode  | 1.39 tok/s | ~12.3 tok/s | ~8.8× |
+| total (47 tokens) | 49 s | ~10 s | ~5× |
+
+See `BENCHMARK.md` for the step-by-step optimization log.
 
 ## Verification
 
@@ -70,3 +86,6 @@ The numerical tests compare first-step logits (top-5 ids, magnitudes), layer-0
 attention output, and a 40-step greedy generation against `transformers`
 reference values captured by `scripts/hf_reference.py`, `scripts/hf_single_token.py`,
 and `scripts/hf_layer_debug.py`.
+
+Weight matrices are stored as raw BF16 (`tensor::WMat`) and dequantized
+in-register inside the AVX2 kernels; F16/F32 inputs are converted to f32 at load.

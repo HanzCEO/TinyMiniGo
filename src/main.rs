@@ -31,9 +31,12 @@ fn run() -> Result<()> {
     }
 
     eprintln!("loading model {} ...", model_path.display());
+    let load_start = std::time::Instant::now();
     let mut m = Model::load(model_path)?;
+    let load_secs = load_start.elapsed().as_secs_f32();
     eprintln!(
-        "loaded: layers={} hidden={} heads={} kv_heads={} head_dim={} vocab={}",
+        "loaded in {:.2}s: layers={} hidden={} heads={} kv_heads={} head_dim={} vocab={}",
+        load_secs,
         m.w.config.num_hidden_layers,
         m.w.config.hidden_size,
         m.w.config.num_attention_heads,
@@ -71,6 +74,7 @@ fn run() -> Result<()> {
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
 
+    let t_start = std::time::Instant::now();
     let result = model::generate(&mut m, &ids, &params, |t| {
         // stream detokenization of each new token
         if let Ok(s) = tok.decode(&[t], true) {
@@ -96,6 +100,19 @@ fn run() -> Result<()> {
     }
 
     println!();
-    eprintln!("\n[{} tokens generated]", result.tokens.len());
+    let elapsed = t_start.elapsed().as_secs_f32();
+    let n_gen = result.tokens.len();
+    let decode_tokens = n_gen.saturating_sub(1); // last gen step is part of prefill+1 forward
+    eprintln!(
+        "\n[{} tokens generated in {:.2}s | prefill: {} tok in {:.2}s ({:.1} tok/s) | decode: ~{} tok in {:.2}s ({:.2} tok/s)]",
+        n_gen,
+        elapsed,
+        ids.len(),
+        result.prefill_secs,
+        ids.len() as f32 / result.prefill_secs.max(1e-9),
+        decode_tokens,
+        elapsed - result.prefill_secs,
+        decode_tokens as f32 / (elapsed - result.prefill_secs).max(1e-9),
+    );
     Ok(())
 }
