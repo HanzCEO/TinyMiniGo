@@ -2,11 +2,12 @@
 
 use crate::config::ModelConfig;
 use crate::safetensors_loader::{Tensor, load_safetensors};
+use crate::tmb;
 use crate::tensor::{
-    apply_repetition_penalty, argmax, dot, matmul_w, matmul_w_into, rms_norm,
+    apply_repetition_penalty, argmax, dot, matmul_w, matmul_w_into,
     rms_norm_into, sample, softmax, WMat,
 };
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use rand::{rngs::StdRng, SeedableRng};
 use std::collections::HashMap;
 use std::path::Path;
@@ -33,6 +34,10 @@ pub struct ModelWeights {
     pub final_norm: Vec<f32>,
     pub lm_head: WMat, // [vocab, hidden]
     pub config: ModelConfig,
+    /// Optional TMB memory map: keeps the backing file alive so `WMat::View`
+    /// tensors (borrowed from the mapping) remain valid. None for the
+    /// owned safetensors path.
+    pub mmap: Option<memmap2::Mmap>,
 }
 
 fn need<'a>(tensors: &'a HashMap<String, Tensor>, name: &str) -> Result<&'a Tensor> {
@@ -41,43 +46,139 @@ fn need<'a>(tensors: &'a HashMap<String, Tensor>, name: &str) -> Result<&'a Tens
         .ok_or_else(|| anyhow!("missing tensor `{name}` in safetensors file"))
 }
 
-fn wmat(t: &Tensor) -> Result<WMat> {
+fn wmat(t: Tensor) -> Result<WMat> {
     Ok(if t.is_bf16() {
-        WMat::BF16(t.bf16_bits().to_vec())
+        WMat::BF16(t.into_bf16_bits())
     } else {
-        WMat::F32(t.as_f32().to_vec())
+        WMat::F32(t.into_f32())
     })
 }
 
 /// Optional int8 weight quantization at load (TMG_I8=1): symmetric per-row
 /// scales. Halves model bytes for the DRAM-bound decode path; lm_head and
 /// norms stay higher-precision. Validated against the BF16 path.
-fn wmat_maybe_i8(t: &Tensor, out_features: usize, in_features: usize) -> Result<WMat> {
+fn wmat_maybe_i8(t: Tensor, out_features: usize, in_features: usize) -> Result<WMat> {
     if std::env::var("TMG_I8").map(|v| v == "1").unwrap_or(false) {
-        let f: Vec<f32> = if t.is_bf16() {
-            t.bf16_bits()
+        if t.is_bf16() {
+            let f: Vec<f32> = t
+                .bf16_bits()
                 .iter()
                 .map(|w| f32::from_bits((*w as u32) << 16))
-                .collect()
+                .collect();
+            Ok(WMat::quantize_i8(&f, out_features, in_features))
         } else {
-            t.as_f32().to_vec()
-        };
-        Ok(WMat::quantize_i8(&f, out_features, in_features))
+            let f = t.into_f32();
+            Ok(WMat::quantize_i8(&f, out_features, in_features))
+        }
     } else {
         wmat(t)
     }
 }
 
 /// Norm weights and the embedding table are consumed elementwise as f32.
-fn f32vec(t: &Tensor) -> Result<Vec<f32>> {
-    Ok(if t.is_bf16() {
-        t.bf16_bits().iter().map(|w| f32::from_bits((*w as u32) << 16)).collect()
+fn f32vec(t: Tensor) -> Result<Vec<f32>> {
+    if t.is_bf16() {
+        Ok(t.bf16_bits()
+            .iter()
+            .map(|w| f32::from_bits((*w as u32) << 16))
+            .collect())
     } else {
-        t.as_f32().to_vec()
-    })
+        Ok(t.into_f32())
+    }
 }
 
 pub fn load_model(model_path: &Path) -> Result<ModelWeights> {
+    if is_tmb(model_path) {
+        load_model_tmb(model_path)
+    } else {
+        load_model_safetensors(model_path)
+    }
+}
+
+fn is_tmb(path: &Path) -> bool {
+    std::fs::read(path)
+        .ok()
+        .map(|b| b.len() >= 4 && &b[0..4] == tmb::MAGIC)
+        .unwrap_or(false)
+}
+
+/// TMB fast path: map the repacked file and borrow every tensor from the
+/// mapping (zero-copy). Embed/norms are pre-converted f32; weights are raw
+/// BF16 views.
+fn load_model_tmb(model_path: &Path) -> Result<ModelWeights> {
+    let file = std::fs::File::open(model_path)
+        .with_context(|| format!("opening {}", model_path.display()))?;
+    let map = unsafe { memmap2::MmapOptions::new().populate().map(&file) }
+        .with_context(|| format!("mmapping {}", model_path.display()))?;
+    let hdr = tmb::parse_tmb_header(&map)?;
+    let config = hdr.config;
+    let tensors = &hdr.index.tensors;
+    let h = config.hidden_size;
+
+    // embed (f32) borrowed from the mapping
+    let embed = tensors
+        .get("model.embed_tokens.weight")
+        .with_context(|| "TMB missing model.embed_tokens.weight")?
+        .f32(&map)?
+        .to_vec();
+    if embed.len() != config.vocab_size * h {
+        bail!(
+            "TMB embed size {} != vocab*hidden {}",
+            embed.len(),
+            config.vocab_size * h
+        );
+    }
+
+    let mut layers = Vec::with_capacity(config.num_hidden_layers);
+    for l in 0..config.num_hidden_layers {
+        let p = move |suffix: &str| format!("model.layers.{l}.{suffix}");
+        let w = |name: &str| -> Result<WMat> {
+            let tr = tensors
+                .get(name)
+                .with_context(|| format!("TMB missing {name}"))?;
+            Ok(WMat::View(tr.offset, tr.len))
+        };
+        let f = |name: &str| -> Result<Vec<f32>> {
+            let tr = tensors
+                .get(name)
+                .with_context(|| format!("TMB missing {name}"))?;
+            Ok(tr.f32(&map)?.to_vec())
+        };
+        layers.push(LayerWeights {
+            wq: w(&p("self_attn.q_proj.weight"))?,
+            wk: w(&p("self_attn.k_proj.weight"))?,
+            wv: w(&p("self_attn.v_proj.weight"))?,
+            wo: w(&p("self_attn.o_proj.weight"))?,
+            w_gate: w(&p("mlp.gate_proj.weight"))?,
+            w_up: w(&p("mlp.up_proj.weight"))?,
+            w_down: w(&p("mlp.down_proj.weight"))?,
+            input_layernorm: f(&p("input_layernorm.weight"))?,
+            post_attention_layernorm: f(&p("post_attention_layernorm.weight"))?,
+        });
+    }
+
+    let final_norm = tensors
+        .get("model.norm.weight")
+        .with_context(|| "TMB missing model.norm.weight")?
+        .f32(&map)?
+        .to_vec();
+
+    let lm_head = match tensors.get("lm_head.weight") {
+        Some(tr) => WMat::View(tr.offset, tr.len),
+        None => WMat::F32(embed.clone()), // tied
+    };
+
+    Ok(ModelWeights {
+        embed,
+        layers,
+        final_norm,
+        lm_head,
+        config,
+        mmap: Some(map),
+    })
+}
+
+pub fn load_model_safetensors(model_path: &Path) -> Result<ModelWeights> {
     let config_path = ModelConfig::config_path_for_model(model_path)
         .ok_or_else(|| anyhow!("config.json not found next to {}", model_path.display()))?;
     let config = ModelConfig::load(&config_path)?;
@@ -108,26 +209,26 @@ pub fn load_model(model_path: &Path) -> Result<ModelWeights> {
     for l in 0..config.num_hidden_layers {
         let p = move |suffix: &str| format!("model.layers.{l}.{suffix}");
         layers.push(LayerWeights {
-            wq: wmat_maybe_i8(need(&tensors, &p("self_attn.q_proj.weight"))?, q_dim, h)?,
-            wk: wmat_maybe_i8(need(&tensors, &p("self_attn.k_proj.weight"))?, kv_dim, h)?,
-            wv: wmat_maybe_i8(need(&tensors, &p("self_attn.v_proj.weight"))?, kv_dim, h)?,
-            wo: wmat_maybe_i8(need(&tensors, &p("self_attn.o_proj.weight"))?, h, q_dim)?,
-            w_gate: wmat_maybe_i8(need(&tensors, &p("mlp.gate_proj.weight"))?, i, h)?,
-            w_up: wmat_maybe_i8(need(&tensors, &p("mlp.up_proj.weight"))?, i, h)?,
-            w_down: wmat_maybe_i8(need(&tensors, &p("mlp.down_proj.weight"))?, h, i)?,
-            input_layernorm: f32vec(need(&tensors, &p("input_layernorm.weight"))?)?,
-            post_attention_layernorm: f32vec(need(&tensors, &p("post_attention_layernorm.weight"))?)?,
+            wq: wmat_maybe_i8(need(&tensors, &p("self_attn.q_proj.weight"))?.clone(), q_dim, h)?,
+            wk: wmat_maybe_i8(need(&tensors, &p("self_attn.k_proj.weight"))?.clone(), kv_dim, h)?,
+            wv: wmat_maybe_i8(need(&tensors, &p("self_attn.v_proj.weight"))?.clone(), kv_dim, h)?,
+            wo: wmat_maybe_i8(need(&tensors, &p("self_attn.o_proj.weight"))?.clone(), h, q_dim)?,
+            w_gate: wmat_maybe_i8(need(&tensors, &p("mlp.gate_proj.weight"))?.clone(), i, h)?,
+            w_up: wmat_maybe_i8(need(&tensors, &p("mlp.up_proj.weight"))?.clone(), i, h)?,
+            w_down: wmat_maybe_i8(need(&tensors, &p("mlp.down_proj.weight"))?.clone(), h, i)?,
+            input_layernorm: f32vec(need(&tensors, &p("input_layernorm.weight"))?.clone())?,
+            post_attention_layernorm: f32vec(need(&tensors, &p("post_attention_layernorm.weight"))?.clone())?,
         });
     }
 
-    let final_norm = f32vec(need(&tensors, "model.norm.weight")?)?;
+    let final_norm = f32vec(need(&tensors, "model.norm.weight")?.clone())?;
 
     // lm_head: use dedicated tensor if present, else tie to embeddings
     // lm_head stays BF16 even in TMG_I8 mode: logits are the most
     // quant-sensitive output and it costs nothing measurable in decode speed
     // (lm_head gemv ≈ 20% of streamed bytes, bandwidth-dominated either way).
     let lm_head = match tensors.get("lm_head.weight") {
-        Some(t) => wmat(t)?,
+        Some(t) => wmat(t.clone())?,
         None => WMat::F32(embed.clone()), // tied by convention when lm_head absent
     };
     let _ = (h, i, q_dim, kv_dim);
@@ -138,6 +239,7 @@ pub fn load_model(model_path: &Path) -> Result<ModelWeights> {
         final_norm,
         lm_head,
         config,
+        mmap: None,
     })
 }
 
@@ -311,9 +413,10 @@ impl Model {
             // --- attention block ---
             rms_norm_into(x, &lw.input_layernorm, c.rms_norm_eps, &mut s.attn_in);
 
-            matmul_w_into(&s.attn_in, &lw.wq, n_q * head_dim, h, &mut s.q_all);
-            matmul_w_into(&s.attn_in, &lw.wk, n_kv * head_dim, h, &mut s.k_all);
-            matmul_w_into(&s.attn_in, &lw.wv, n_kv * head_dim, h, &mut s.v_all);
+            let mm = &self.w.mmap;
+            matmul_w_into(&s.attn_in, &lw.wq, n_q * head_dim, h, &mut s.q_all, mm);
+            matmul_w_into(&s.attn_in, &lw.wk, n_kv * head_dim, h, &mut s.k_all, mm);
+            matmul_w_into(&s.attn_in, &lw.wv, n_kv * head_dim, h, &mut s.v_all, mm);
 
             // rope per head (in place on q_all / k_all)
             let pos = cache.len(layer_idx);
@@ -355,7 +458,7 @@ impl Model {
                 }
             }
 
-            matmul_w_into(&s.attn_out, &lw.wo, h, n_q * head_dim, &mut s.proj);
+            matmul_w_into(&s.attn_out, &lw.wo, h, n_q * head_dim, &mut s.proj, mm);
             for (xi, ai) in x.iter_mut().zip(s.proj.iter()) {
                 *xi += *ai;
             }
@@ -365,12 +468,12 @@ impl Model {
             if debug {
                 eprintln!("L{} attn_out first8: {:?}", layer_idx, &x[..8]);
             }
-            matmul_w_into(&s.mlp_in, &lw.w_gate, c.intermediate_size, h, &mut s.gate);
-            matmul_w_into(&s.mlp_in, &lw.w_up, c.intermediate_size, h, &mut s.up);
+            matmul_w_into(&s.mlp_in, &lw.w_gate, c.intermediate_size, h, &mut s.gate, mm);
+            matmul_w_into(&s.mlp_in, &lw.w_up, c.intermediate_size, h, &mut s.up, mm);
             for (g, u) in s.gate.iter_mut().zip(s.up.iter()) {
                 *g = *g / (1.0 + (-*g).exp()) * u;
             }
-            matmul_w_into(&s.gate, &lw.w_down, h, c.intermediate_size, &mut s.down);
+            matmul_w_into(&s.gate, &lw.w_down, h, c.intermediate_size, &mut s.down, mm);
             for (xi, di) in x.iter_mut().zip(s.down.iter()) {
                 *xi += *di;
             }
@@ -383,7 +486,7 @@ impl Model {
         // caller owns the returned Vec)
         rms_norm_into(x, &self.w.final_norm, c.rms_norm_eps, &mut s.attn_in);
         let mut logits = vec![0.0f32; c.vocab_size];
-        matmul_w_into(&s.attn_in, &self.w.lm_head, c.vocab_size, h, &mut logits);
+        matmul_w_into(&s.attn_in, &self.w.lm_head, c.vocab_size, h, &mut logits, &self.w.mmap);
         Ok(logits)
     }
 
@@ -422,9 +525,10 @@ impl Model {
             let mut normed = x.clone();
             rms_norm_batch(&mut normed, &lw.input_layernorm, c.rms_norm_eps, h);
 
-            let mut q_all = matmul_batch_w(&normed, &lw.wq, n_q * head_dim, h, t);
-            let mut k_all = matmul_batch_w(&normed, &lw.wk, n_kv * head_dim, h, t);
-            let v_all = matmul_batch_w(&normed, &lw.wv, n_kv * head_dim, h, t);
+            let mm = &self.w.mmap;
+            let mut q_all = matmul_batch_w(&normed, &lw.wq, n_q * head_dim, h, t, mm);
+            let mut k_all = matmul_batch_w(&normed, &lw.wk, n_kv * head_dim, h, t, mm);
+            let v_all = matmul_batch_w(&normed, &lw.wv, n_kv * head_dim, h, t, mm);
 
             // rope per head per token
             for ti in 0..t {
@@ -459,7 +563,7 @@ impl Model {
                 start_pos,
             );
 
-            let attn_proj = matmul_batch_w(&attn_out, &lw.wo, h, n_q * head_dim, t);
+            let attn_proj = matmul_batch_w(&attn_out, &lw.wo, h, n_q * head_dim, t, mm);
             for (xi, ai) in x.iter_mut().zip(attn_proj.iter()) {
                 *xi += *ai;
             }
@@ -467,14 +571,14 @@ impl Model {
             // --- MLP block ---
             let mut normed = x.clone();
             rms_norm_batch(&mut normed, &lw.post_attention_layernorm, c.rms_norm_eps, h);
-            let mut gate = matmul_batch_w(&normed, &lw.w_gate, c.intermediate_size, h, t);
-            let up = matmul_batch_w(&normed, &lw.w_up, c.intermediate_size, h, t);
+            let mut gate = matmul_batch_w(&normed, &lw.w_gate, c.intermediate_size, h, t, mm);
+            let up = matmul_batch_w(&normed, &lw.w_up, c.intermediate_size, h, t, mm);
             // fused silu(gate) * up
             for i in 0..t * c.intermediate_size {
                 let g = gate[i];
                 gate[i] = g / (1.0 + (-g).exp()) * up[i];
             }
-            let down = matmul_batch_w(&gate, &lw.w_down, h, c.intermediate_size, t);
+            let down = matmul_batch_w(&gate, &lw.w_down, h, c.intermediate_size, t, mm);
             for (xi, di) in x.iter_mut().zip(down.iter()) {
                 *xi += *di;
             }
@@ -482,7 +586,7 @@ impl Model {
 
         rms_norm_batch(&mut x[(t - 1) * h..], &self.w.final_norm, c.rms_norm_eps, h);
         let last = &x[(t - 1) * h..];
-        Ok(matmul_w(last, &self.w.lm_head, c.vocab_size, h))
+        Ok(matmul_w(last, &self.w.lm_head, c.vocab_size, h, &self.w.mmap))
     }
 }
 
@@ -657,6 +761,7 @@ mod tests {
                 final_norm: tensors.get("model.norm.weight").unwrap().as_f32().to_vec(),
                 lm_head: get("lm_head.weight"),
                 config: cfg,
+                mmap: None,
             },
             rope,
             scratch,

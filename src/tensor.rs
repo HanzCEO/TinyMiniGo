@@ -200,6 +200,37 @@ pub enum WMat {
     BF16(Vec<u16>),
     /// (quantized rows, per-row scale)
     I8(Vec<i8>, Vec<f32>),
+    /// Borrowed zero-copy view into a TMB mmap: (byte offset, byte len) of
+    /// BF16 raw bits. Resolved via `WMatView::bytes()` during matmul.
+    View(u64, u64),
+}
+
+/// Marker trait: types that can resolve a borrowed `WMat::View` into raw
+/// bytes (the TMB mmap). Implemented by `&[u8]` so tests can use a plain
+/// slice. Kernels that match `WMat::View` require `R: WMatView`.
+pub trait WMatView: Send + Sync {
+    fn wmat_bytes(&self, off: u64, len: u64) -> Option<&[u8]>;
+}
+
+impl WMatView for &[u8] {
+    fn wmat_bytes(&self, off: u64, len: u64) -> Option<&[u8]> {
+        let start = off as usize;
+        let end = start + len as usize;
+        self.get(start..end)
+    }
+}
+
+impl WMatView for Option<memmap2::Mmap> {
+    fn wmat_bytes(&self, off: u64, len: u64) -> Option<&[u8]> {
+        match self {
+            Some(m) => {
+                let start = off as usize;
+                let end = start + len as usize;
+                m.get(start..end)
+            }
+            None => None,
+        }
+    }
 }
 
 impl WMat {
@@ -208,12 +239,37 @@ impl WMat {
             WMat::F32(v) => v.len(),
             WMat::BF16(v) => v.len(),
             WMat::I8(q, _) => q.len(),
+            WMat::View(_, len) => (*len as usize) / 2, // BF16: 2 bytes/elem
         }
     }
 
     #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// Resolve a `WMat::View` into a borrowed `[u16]` BF16 slice.
+    pub fn bf16_view<'m, R: WMatView>(&self, m: &'m R) -> Option<&'m [u16]> {
+        match self {
+            WMat::View(off, len) => {
+                let b = m.wmat_bytes(*off, *len)?;
+                if b.len() % 2 != 0 {
+                    return None;
+                }
+                // Safe: TMB offsets are 8-byte aligned and mmap base is
+                // page-aligned, so this slice start is at least 2-aligned.
+                Some(bytemuck::cast_slice(b))
+            }
+            _ => None,
+        }
+    }
+
+    /// Extract the (offset, len) of a `WMat::View` (for tests / tools).
+    pub fn view_range(&self) -> Option<(u64, u64)> {
+        match self {
+            WMat::View(off, len) => Some((*off, *len)),
+            _ => None,
+        }
     }
 
     /// Symmetric per-row int8 quantization from an f32 row-major matrix.
@@ -249,15 +305,16 @@ impl WMat {
                 .iter()
                 .map(|&w| w as f32 * s[o])
                 .collect(),
+            WMat::View(_, _) => vec![], // no owned data to slice; use bf16_view()
         }
     }
 }
 
 /// y = x @ W^T where W is [out, in] row-major (HF convention: nn.Linear stores weight [out, in]).
 /// (gemv path: dot products via SIMD, output rows split across threads.)
-pub fn matmul_w(x: &[f32], w: &WMat, out_features: usize, in_features: usize) -> Vec<f32> {
+pub fn matmul_w<R: WMatView>(x: &[f32], w: &WMat, out_features: usize, in_features: usize, m: &R) -> Vec<f32> {
     let mut y = vec![0.0f32; out_features];
-    matmul_w_into(x, w, out_features, in_features, &mut y);
+    matmul_w_into(x, w, out_features, in_features, &mut y, m);
     y
 }
 
@@ -271,7 +328,14 @@ pub fn matmul(x: &[f32], w: &[f32], out_features: usize, in_features: usize) -> 
     y
 }
 
-pub fn matmul_w_into(x: &[f32], w: &WMat, out_features: usize, in_features: usize, y: &mut [f32]) {
+pub fn matmul_w_into<R: WMatView>(
+    x: &[f32],
+    w: &WMat,
+    out_features: usize,
+    in_features: usize,
+    y: &mut [f32],
+    m: &R,
+) {
     debug_assert_eq!(y.len(), out_features);
     // int8 fast path: quantize activation once, integer dots per row, scale
     if let WMat::I8(q, scales) = w {
@@ -335,6 +399,15 @@ pub fn matmul_w_into(x: &[f32], w: &WMat, out_features: usize, in_features: usiz
                     *y_o = dot_bf16(x, row);
                 }
             }
+            WMat::View(off, len) => {
+                if let Some(wb) = m.wmat_bytes(*off, *len) {
+                    let wb: &[u16] = bytemuck::cast_slice(wb);
+                    for (o, y_o) in y.iter_mut().enumerate() {
+                        let row = &wb[o * in_features..(o + 1) * in_features];
+                        *y_o = dot_bf16(x, row);
+                    }
+                }
+            }
             // I8 already handled above (AVX2) — scalar fallback reached on
             // non-AVX2 only, handled before threading; keep for exhaustiveness
             WMat::I8(_, _) => unreachable!("I8 scalar path handled earlier"),
@@ -366,6 +439,21 @@ pub fn matmul_w_into(x: &[f32], w: &WMat, out_features: usize, in_features: usiz
                         *y_o = dot_bf16(x, row);
                     }
                 });
+            }
+        }),
+        WMat::View(off, len) => std::thread::scope(|s| {
+            if let Some(wb) = m.wmat_bytes(*off, *len) {
+                let wb: &[u16] = bytemuck::cast_slice(wb);
+                for (ti, ys) in y.chunks_mut(chunk).enumerate() {
+                    let start = ti * chunk;
+                    s.spawn(move || {
+                        for (i, y_o) in ys.iter_mut().enumerate() {
+                            let o = start + i;
+                            let row = &wb[o * in_features..(o + 1) * in_features];
+                            *y_o = dot_bf16(x, row);
+                        }
+                    });
+                }
             }
         }),
     }
@@ -467,21 +555,36 @@ pub fn matmul_batch_into(x: &[f32], w: &[f32], out_features: usize, in_features:
 /// Batched matmul: x is [T, in_features] row-major, W is [out, in]; returns [T, out].
 /// For each output row o (weight row streamed once), computes T dot products.
 /// The weight row is the large operand, so this maximizes cache reuse.
-pub fn matmul_batch_w(x: &[f32], w: &WMat, out_features: usize, in_features: usize, n_tokens: usize) -> Vec<f32> {
+pub fn matmul_batch_w<R: WMatView>(
+    x: &[f32],
+    w: &WMat,
+    out_features: usize,
+    in_features: usize,
+    n_tokens: usize,
+    m: &R,
+) -> Vec<f32> {
     assert_eq!(x.len(), n_tokens * in_features, "batched matmul input dim mismatch");
     let mut y = vec![0.0f32; n_tokens * out_features];
-    matmul_batch_w_into(x, w, out_features, in_features, n_tokens, &mut y);
+    matmul_batch_w_into(x, w, out_features, in_features, n_tokens, &mut y, m);
     y
 }
 
 /// Writes [T, out] = x[T,in] @ W^T into a caller-provided buffer.
-pub fn matmul_batch_w_into(x: &[f32], w: &WMat, out_features: usize, in_features: usize, n_tokens: usize, y: &mut [f32]) {
+pub fn matmul_batch_w_into<R: WMatView>(
+    x: &[f32],
+    w: &WMat,
+    out_features: usize,
+    in_features: usize,
+    n_tokens: usize,
+    y: &mut [f32],
+    m: &R,
+) {
     assert_eq!(x.len(), n_tokens * in_features, "batched matmul input dim mismatch");
     debug_assert_eq!(y.len(), n_tokens * out_features);
     #[cfg(target_arch = "x86_64")]
     if has_avx2_fma() && n_tokens >= 2 {
         // safety: feature detected at runtime
-        unsafe { matmul_batch_w_avx2(x, w, out_features, in_features, n_tokens, y) };
+        unsafe { matmul_batch_w_avx2(x, w, out_features, in_features, n_tokens, y, m) };
         return;
     }
     let nthreads = num_threads().min(out_features);
@@ -502,6 +605,18 @@ pub fn matmul_batch_w_into(x: &[f32], w: &WMat, out_features: usize, in_features
                     for t in 0..n_tokens {
                         let xv = &x[t * in_features..(t + 1) * in_features];
                         y[t * out_features + o] = dot_bf16(xv, row);
+                    }
+                }
+            }
+            WMat::View(off, len) => {
+                if let Some(wb) = m.wmat_bytes(*off, *len) {
+                    let wb: &[u16] = bytemuck::cast_slice(wb);
+                    for o in 0..out_features {
+                        let row = &wb[o * in_features..(o + 1) * in_features];
+                        for t in 0..n_tokens {
+                            let xv = &x[t * in_features..(t + 1) * in_features];
+                            y[t * out_features + o] = dot_bf16(xv, row);
+                        }
                     }
                 }
             }
@@ -579,6 +694,35 @@ pub fn matmul_batch_w_into(x: &[f32], w: &WMat, out_features: usize, in_features
                 }
             }
         }),
+        WMat::View(off, len) => std::thread::scope(|s| {
+            if let Some(wb) = m.wmat_bytes(*off, *len) {
+                let wb: &[u16] = bytemuck::cast_slice(wb);
+                let mut handles = Vec::new();
+                for ti in 0..nthreads {
+                    let start = ti * chunk;
+                    let rows = chunk.min(out_features - start);
+                    if rows == 0 { continue; }
+                    handles.push((start, rows, s.spawn(move || {
+                        let mut local = vec![0.0f32; n_tokens * rows];
+                        for o in 0..rows {
+                            let row = &wb[(start + o) * in_features..(start + o + 1) * in_features];
+                            for t in 0..n_tokens {
+                                let xv = &x[t * in_features..(t + 1) * in_features];
+                                local[t * rows + o] = dot_bf16(xv, row);
+                            }
+                        }
+                        local
+                    })));
+                }
+                for (start, rows, h) in handles {
+                    let local = h.join().unwrap();
+                    for t in 0..n_tokens {
+                        y[t * out_features + start..t * out_features + start + rows]
+                            .copy_from_slice(&local[t * rows..(t + 1) * rows]);
+                    }
+                }
+            }
+        }),
     }
 }
 
@@ -594,13 +738,14 @@ pub fn matmul_batch_w_into(x: &[f32], w: &WMat, out_features: usize, in_features
 /// (cvtepi8_epi32×2→cvtepi32_ps×2) per 8-lane chunk; scales applied at writeback.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
-unsafe fn matmul_batch_w_avx2(
+unsafe fn matmul_batch_w_avx2<R: WMatView>(
     x: &[f32],
     w: &WMat,
     out_features: usize,
     in_features: usize,
     n_tokens: usize,
     y: &mut [f32],
+    m: &R,
 ) { unsafe {
     use std::arch::x86_64::*;
     debug_assert_eq!(x.len(), n_tokens * in_features);
@@ -611,7 +756,7 @@ unsafe fn matmul_batch_w_avx2(
     let nthreads = num_threads().min(njobs).max(1);
 
     if nthreads <= 1 {
-        gemm_tile_avx2(x, w, out_features, in_features, n_tokens, y, 0, out_features);
+        gemm_tile_avx2(x, w, out_features, in_features, n_tokens, y, 0, out_features, m);
         return;
     }
 
@@ -637,7 +782,7 @@ unsafe fn matmul_batch_w_avx2(
             let ylen = y.len();
             handles.push(s.spawn(move || {
                 let yband = unsafe { std::slice::from_raw_parts_mut(yp as *mut f32, ylen) };
-                gemm_tile_avx2(x, w, out_features, in_features, n_tokens, yband, start_row, end_row)
+                gemm_tile_avx2(x, w, out_features, in_features, n_tokens, yband, start_row, end_row, m)
             }));
         }
         for h in handles {
@@ -651,7 +796,7 @@ unsafe fn matmul_batch_w_avx2(
 /// Writes go straight into y (rows are disjoint across threads).
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
-unsafe fn gemm_tile_avx2(
+unsafe fn gemm_tile_avx2<R: WMatView>(
     x: &[f32],
     w: &WMat,
     out_features: usize,
@@ -660,6 +805,7 @@ unsafe fn gemm_tile_avx2(
     y: &mut [f32],
     start_row: usize,
     end_row: usize,
+    m: &R,
 ) { unsafe {
     use std::arch::x86_64::*;
     let kchunks = in_features / 8;
@@ -674,8 +820,8 @@ unsafe fn gemm_tile_avx2(
             let mut acc = [[_mm256_setzero_ps(); 2]; 4];
             for k in 0..kchunks {
                 let ki = k * 8;
-                let w0 = load_w_m256(w, in_features, o, ki);
-                let w1 = load_w_m256(w, in_features, o + 1, ki);
+                let w0 = load_w_m256(w, m, in_features, o, ki);
+                let w1 = load_w_m256(w, m, in_features, o + 1, ki);
                 for ti in 0..4 {
                     let xv = _mm256_loadu_ps(x.as_ptr().add((tbase + ti) * in_features + ki));
                     acc[ti][0] = _mm256_fmadd_ps(xv, w0, acc[ti][0]);
@@ -687,8 +833,8 @@ unsafe fn gemm_tile_avx2(
                 let mut s1 = reduce_add(acc[ti][1]);
                 for k in (kchunks * 8)..(kchunks * 8 + ktail) {
                     let xk = x[(tbase + ti) * in_features + k];
-                    s0 += xk * wf_elem(w, in_features, o, k);
-                    s1 += xk * wf_elem(w, in_features, o + 1, k);
+                    s0 += xk * wf_elem(w, m, in_features, o, k);
+                    s1 += xk * wf_elem(w, m, in_features, o + 1, k);
                 }
                 y[(tbase + ti) * out_features + o] = s0 * w_row_scale(w, o);
                 y[(tbase + ti) * out_features + o + 1] = s1 * w_row_scale(w, o + 1);
@@ -697,8 +843,8 @@ unsafe fn gemm_tile_avx2(
         // token tail (<4): reuse the same weight rows via scalar dots
         for t in tblock..n_tokens {
             let xv = &x[t * in_features..(t + 1) * in_features];
-            y[t * out_features + o] = dot_w_row_avx2(xv, w, in_features, o);
-            y[t * out_features + o + 1] = dot_w_row_avx2(xv, w, in_features, o + 1);
+            y[t * out_features + o] = dot_w_row_avx2(xv, w, m, in_features, o);
+            y[t * out_features + o + 1] = dot_w_row_avx2(xv, w, m, in_features, o + 1);
         }
         o += 2;
     }
@@ -706,7 +852,7 @@ unsafe fn gemm_tile_avx2(
     if o < end_row {
         for t in 0..n_tokens {
             let xv = &x[t * in_features..(t + 1) * in_features];
-            y[t * out_features + o] = dot_w_row_avx2(xv, w, in_features, o);
+            y[t * out_features + o] = dot_w_row_avx2(xv, w, m, in_features, o);
         }
     }
 }}
@@ -715,10 +861,18 @@ unsafe fn gemm_tile_avx2(
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 #[inline]
-unsafe fn dot_w_row_avx2(x: &[f32], w: &WMat, in_features: usize, o: usize) -> f32 {
+unsafe fn dot_w_row_avx2<R: WMatView>(x: &[f32], w: &WMat, m: &R, in_features: usize, o: usize) -> f32 {
     match w {
         WMat::F32(wf) => dot_f32_avx2(x, &wf[o * in_features..(o + 1) * in_features]),
         WMat::BF16(wb) => dot_bf16_avx2(x, &wb[o * in_features..(o + 1) * in_features]),
+        WMat::View(off, len) => {
+            if let Some(wb) = m.wmat_bytes(*off, *len) {
+                let wb: &[u16] = bytemuck::cast_slice(wb);
+                dot_bf16_avx2(x, &wb[o * in_features..(o + 1) * in_features])
+            } else {
+                0.0
+            }
+        }
         WMat::I8(q, s) => {
             // rare tail path; scalar is fine
             let mut acc = 0f32;
@@ -734,7 +888,7 @@ unsafe fn dot_w_row_avx2(x: &[f32], w: &WMat, in_features: usize, o: usize) -> f
 #[inline]
 fn w_row_scale(w: &WMat, o: usize) -> f32 {
     match w {
-        WMat::F32(_) | WMat::BF16(_) => 1.0,
+        WMat::F32(_) | WMat::BF16(_) | WMat::View(_, _) => 1.0,
         WMat::I8(_, s) => s[o],
     }
 }
@@ -742,7 +896,7 @@ fn w_row_scale(w: &WMat, o: usize) -> f32 {
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 #[inline]
-unsafe fn load_w_m256(w: &WMat, in_features: usize, o: usize, ki: usize) -> std::arch::x86_64::__m256 { unsafe {
+unsafe fn load_w_m256<R: WMatView>(w: &WMat, m: &R, in_features: usize, o: usize, ki: usize) -> std::arch::x86_64::__m256 { unsafe {
     use std::arch::x86_64::*;
     match w {
         WMat::F32(wf) => _mm256_loadu_ps(wf.as_ptr().add(o * in_features + ki)),
@@ -750,6 +904,16 @@ unsafe fn load_w_m256(w: &WMat, in_features: usize, o: usize, ki: usize) -> std:
             let w128 = _mm_loadu_si128(wb.as_ptr().add(o * in_features + ki) as *const __m128i);
             let w256 = _mm256_cvtepu16_epi32(w128);
             _mm256_castsi256_ps(_mm256_slli_epi32(w256, 16))
+        }
+        WMat::View(off, len) => {
+            if let Some(wb) = m.wmat_bytes(*off, *len) {
+                let wb: &[u16] = bytemuck::cast_slice(wb);
+                let w128 = _mm_loadu_si128(wb.as_ptr().add(o * in_features + ki) as *const __m128i);
+                let w256 = _mm256_cvtepu16_epi32(w128);
+                _mm256_castsi256_ps(_mm256_slli_epi32(w256, 16))
+            } else {
+                _mm256_setzero_ps()
+            }
         }
         WMat::I8(q, _) => {
             // 8 x i8 -> 8 x i32 -> 8 x f32 (scale applied at writeback)
@@ -762,10 +926,18 @@ unsafe fn load_w_m256(w: &WMat, in_features: usize, o: usize, ki: usize) -> std:
 
 #[cfg(target_arch = "x86_64")]
 #[inline]
-unsafe fn wf_elem(w: &WMat, in_features: usize, o: usize, k: usize) -> f32 {
+unsafe fn wf_elem<R: WMatView>(w: &WMat, m: &R, in_features: usize, o: usize, k: usize) -> f32 {
     match w {
         WMat::F32(wf) => wf[o * in_features + k],
         WMat::BF16(wb) => f32::from_bits((wb[o * in_features + k] as u32) << 16),
+        WMat::View(off, len) => {
+            if let Some(wb) = m.wmat_bytes(*off, *len) {
+                let wb: &[u16] = bytemuck::cast_slice(wb);
+                f32::from_bits((wb[o * in_features + k] as u32) << 16)
+            } else {
+                0.0
+            }
+        }
         WMat::I8(q, s) => q[o * in_features + k] as f32 * s[o],
     }
 }

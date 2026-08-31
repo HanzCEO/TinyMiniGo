@@ -1,14 +1,15 @@
 use std::collections::HashMap;
-use std::fs;
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
+use memmap2::MmapOptions;
 use safetensors::tensor::SafeTensors;
 use safetensors::tensor::Dtype as DataType;
 
 /// A tensor loaded into memory.
 /// BF16 tensors keep their raw bits (dequantized in-register in the gemm kernels)
 /// to halve memory footprint and bandwidth; F16/F32 are converted to f32 at load.
+/// `data` is a raw byte view so tensors can borrow directly from the memory map.
 #[derive(Clone)]
 pub struct Tensor {
     #[allow(dead_code)] // kept alongside data for shape-aware consumers
@@ -20,7 +21,7 @@ pub struct Tensor {
 pub enum TensorData {
     F32(Vec<f32>),
     F16(Vec<f32>),      // converted from f16 at load
-    BF16Raw(Vec<u16>),  // raw bf16 bits, dequantized in the math kernels
+    BF16Raw(Vec<u8>),   // raw bf16 bits (2 per element), dequantized in the math kernels
 }
 
 impl Tensor {
@@ -33,13 +34,49 @@ impl Tensor {
 
     pub fn bf16_bits(&self) -> &[u16] {
         match &self.data {
-            TensorData::BF16Raw(v) => v,
+            // BF16 data is 2-byte aligned (all offsets are even in practice);
+            // the 2-byte alignment invariant is enforced at construction.
+            TensorData::BF16Raw(v) => bytemuck::cast_slice(v),
             _ => panic!("bf16_bits on non-BF16 tensor"),
+        }
+    }
+
+    /// Raw BF16 bytes (used by the TMB repack tool, which copies them as-is).
+    pub fn bf16_bytes(&self) -> &[u8] {
+        match &self.data {
+            TensorData::BF16Raw(v) => v,
+            _ => panic!("bf16_bytes on non-BF16 tensor"),
         }
     }
 
     pub fn is_bf16(&self) -> bool {
         matches!(self.data, TensorData::BF16Raw(_))
+    }
+
+    /// Move the owned BF16 bits out (used to build WMat without a second copy).
+    pub fn into_bf16_bits(self) -> Vec<u16> {
+        match self.data {
+            TensorData::BF16Raw(v) => {
+                // BF16 byte len is always even, so this reinterprets in place.
+                let mut v = v;
+                let ptr = v.as_mut_ptr() as *mut u16;
+                let len = v.len() / 2;
+                let cap = v.capacity() / 2;
+                std::mem::forget(v);
+                // Safety: the byte Vec is 2-byte aligned (heap allocations are
+                // at least 8-byte aligned) and length/capacity are exact.
+                unsafe { Vec::from_raw_parts(ptr, len, cap) }
+            }
+            _ => panic!("into_bf16_bits on non-BF16 tensor"),
+        }
+    }
+
+    /// Move the owned f32 data out (used to build WMat / f32 vecs without a copy).
+    pub fn into_f32(self) -> Vec<f32> {
+        match self.data {
+            TensorData::F32(v) | TensorData::F16(v) => v,
+            TensorData::BF16Raw(_) => panic!("into_f32 on raw BF16 tensor; use bf16_bits()"),
+        }
     }
 }
 
@@ -57,26 +94,34 @@ fn read_safetensors_header(bytes: &[u8]) -> Result<serde_json::Value> {
     Ok(header)
 }
 
-/// Load all tensors from a safetensors file into memory (converted to f32-compatible forms).
+/// Load all tensors from a safetensors file.
+///
+/// The file is memory-mapped with MAP_POPULATE (prefault + readahead on
+/// Linux): tensor data is copied out of the mapping in bulk (one memcpy per
+/// tensor) and BF16 bits are kept raw, so loading is a single pass over the
+/// file with no per-element conversion loops.
 pub fn load_safetensors(path: &Path) -> Result<HashMap<String, Tensor>> {
-    let bytes = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-    if bytes.len() < 8 {
+    let file = std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let map = unsafe { MmapOptions::new().populate().map(&file) }
+        .with_context(|| format!("mmapping {}", path.display()))?;
+    if map.len() < 8 {
         bail!("safetensors file too small: {}", path.display());
     }
-    let _header = read_safetensors_header(&bytes)?;
+    let _header = read_safetensors_header(&map)?;
 
-    let st = SafeTensors::deserialize(&bytes)?;
+    let st = SafeTensors::deserialize(&map)?;
     let mut out = HashMap::new();
     for (name, view) in st.iter() {
         let shape: Vec<usize> = view.shape().to_vec();
         let data = match view.dtype() {
             DataType::F32 => {
-                let raw: Vec<f32> = view
-                    .data()
-                    .chunks_exact(4)
-                    .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
-                    .collect();
-                TensorData::F32(raw)
+                // Bulk-copy the raw bytes: input is 4-byte aligned by the
+                // safetensors layout, so this is a single memcpy per tensor.
+                let bytes = view.data();
+                if bytes.len() % 4 != 0 {
+                    bail!("F32 tensor `{name}` has non-multiple-of-4 byte length");
+                }
+                TensorData::F32(bytemuck::cast_slice(bytes).to_vec())
             }
             DataType::F16 => {
                 let raw: Vec<f32> = view
@@ -87,12 +132,7 @@ pub fn load_safetensors(path: &Path) -> Result<HashMap<String, Tensor>> {
                 TensorData::F16(raw)
             }
             DataType::BF16 => {
-                let raw: Vec<u16> = view
-                    .data()
-                    .chunks_exact(2)
-                    .map(|c| u16::from_le_bytes(c.try_into().unwrap()))
-                    .collect();
-                TensorData::BF16Raw(raw)
+                TensorData::BF16Raw(view.data().to_vec())
             }
             other => bail!(
                 "unsupported dtype {:?} for tensor {} in {}",

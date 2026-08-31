@@ -34,6 +34,81 @@ fn get_f32(cfg: &serde_json::Value, key: &str, default: f32) -> f32 {
 }
 
 impl ModelConfig {
+    /// Build a config from an already-parsed JSON value (used by the TMB
+    /// loader, which embeds the config in the repacked file).
+    pub fn from_json(cfg: &serde_json::Value) -> Result<Self> {
+        let hidden_size = get_usize(cfg, "hidden_size")?;
+        let num_attention_heads = get_usize(cfg, "num_attention_heads")?;
+        let num_key_value_heads = cfg
+            .get("num_key_value_heads")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize)
+            .unwrap_or(num_attention_heads);
+        let head_dim = cfg
+            .get("head_dim")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize)
+            .unwrap_or(hidden_size / num_attention_heads);
+
+        let rope_theta = cfg
+            .get("rope_theta")
+            .and_then(|v| v.as_f64())
+            .or_else(|| {
+                cfg.get("rope_parameters")
+                    .and_then(|r| r.get("rope_theta"))
+                    .and_then(|v| v.as_f64())
+            })
+            .map(|v| v as f32)
+            .unwrap_or(10000.0);
+
+        let eos_token_ids = match cfg.get("eos_token_id") {
+            Some(serde_json::Value::Number(n)) => {
+                vec![n.as_u64().context("bad eos_token_id")? as u32]
+            }
+            Some(serde_json::Value::Array(arr)) => arr
+                .iter()
+                .filter_map(|v| v.as_u64().map(|x| x as u32))
+                .collect(),
+            _ => vec![],
+        };
+
+        Ok(Self {
+            hidden_size,
+            num_hidden_layers: get_usize(cfg, "num_hidden_layers")?,
+            num_attention_heads,
+            num_key_value_heads,
+            head_dim,
+            intermediate_size: get_usize(cfg, "intermediate_size")?,
+            rms_norm_eps: get_f32(cfg, "rms_norm_eps", 1e-5),
+            rope_theta,
+            vocab_size: get_usize(cfg, "vocab_size")?,
+            eos_token_ids,
+            bos_token_id: cfg
+                .get("bos_token_id")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as u32)
+                .unwrap_or(0),
+        })
+    }
+
+    /// Serialize the runtime-relevant fields to JSON (used by the TMB
+    /// repack tool; the loader parses it back via `from_json`).
+    pub fn to_json(&self) -> Result<serde_json::Value> {
+        Ok(serde_json::json!({
+            "hidden_size": self.hidden_size,
+            "num_hidden_layers": self.num_hidden_layers,
+            "num_attention_heads": self.num_attention_heads,
+            "num_key_value_heads": self.num_key_value_heads,
+            "head_dim": self.head_dim,
+            "intermediate_size": self.intermediate_size,
+            "rms_norm_eps": self.rms_norm_eps,
+            "rope_theta": self.rope_theta,
+            "vocab_size": self.vocab_size,
+            "eos_token_ids": self.eos_token_ids,
+            "bos_token_id": self.bos_token_id,
+        }))
+    }
+
     pub fn load(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("reading config {}", path.display()))?;

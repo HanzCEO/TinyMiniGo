@@ -4,6 +4,7 @@ mod model;
 mod safetensors_loader;
 mod template;
 mod tensor;
+mod tmb;
 mod tokenizer;
 
 use anyhow::Result;
@@ -24,6 +25,15 @@ fn main() {
 
 fn run() -> Result<()> {
     let args = Args::parse();
+
+    if let Some(dst) = &args.repack {
+        let src_path = Path::new(&args.model);
+        let cfg_path = config::ModelConfig::config_path_for_model(src_path)
+            .ok_or_else(|| anyhow::anyhow!("config.json not found next to {}", src_path.display()))?;
+        let cfg = config::ModelConfig::load(&cfg_path)?;
+        tmb::write_tmb(src_path, Path::new(dst), &cfg)?;
+        return Ok(());
+    }
 
     if let Ok(t) = std::env::var("TMG_THREADS") {
         if let Ok(n) = t.parse::<usize>() {

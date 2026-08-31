@@ -2,6 +2,7 @@
 #[path = "../src/safetensors_loader.rs"] pub mod safetensors_loader;
 #[path = "../src/model.rs"] pub mod model;
 #[path = "../src/tensor.rs"] pub mod tensor;
+#[path = "../src/tmb.rs"] pub mod tmb;
 
 use model::{KvCache, Model};
 use std::path::Path;
@@ -23,9 +24,9 @@ fn layer0_o_proj_matches_reference() {
 
     let x0: Vec<f32> = m.w.embed[0..h].to_vec();
     let ln1 = tensor::rms_norm(&x0, &lw.input_layernorm, c.rms_norm_eps);
-    let q = tensor::matmul_w(&ln1, &lw.wq, c.num_attention_heads * c.head_dim, h);
-    let k = tensor::matmul_w(&ln1, &lw.wk, c.num_key_value_heads * c.head_dim, h);
-    let v = tensor::matmul_w(&ln1, &lw.wv, c.num_key_value_heads * c.head_dim, h);
+    let q = tensor::matmul_w(&ln1, &lw.wq, c.num_attention_heads * c.head_dim, h, &m.w.mmap);
+    let k = tensor::matmul_w(&ln1, &lw.wk, c.num_key_value_heads * c.head_dim, h, &m.w.mmap);
+    let v = tensor::matmul_w(&ln1, &lw.wv, c.num_key_value_heads * c.head_dim, h, &m.w.mmap);
 
     let n_q = c.num_attention_heads;
     let n_kv = c.num_key_value_heads;
@@ -56,7 +57,7 @@ fn layer0_o_proj_matches_reference() {
         let out = tensor::attention_row(&qv, &keys, &vals, keys.len(), scale);
         attn[hd * c.head_dim..(hd + 1) * c.head_dim].copy_from_slice(&out);
     }
-    let o = tensor::matmul_w(&attn, &lw.wo, h, n_q * c.head_dim);
+    let o = tensor::matmul_w(&attn, &lw.wo, h, n_q * c.head_dim, &m.w.mmap);
 
     // HF reference (scripts/hf_layer_debug.py): o_out first 8
     let hf = [0.363_092_1f32, -0.230_118_9, 0.818_211, 0.340_060_1,

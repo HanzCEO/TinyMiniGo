@@ -2,6 +2,7 @@
 #[path = "../src/safetensors_loader.rs"] pub mod safetensors_loader;
 #[path = "../src/model.rs"] pub mod model;
 #[path = "../src/tensor.rs"] pub mod tensor;
+#[path = "../src/tmb.rs"] pub mod tmb;
 
 use model::{KvCache, Model};
 use std::path::Path;

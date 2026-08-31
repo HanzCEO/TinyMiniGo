@@ -46,4 +46,9 @@ pub struct Args {
     /// Debug: dump first-step logits to a JSON file (for cross-checking)
     #[arg(long = "dump-first-logits", value_name = "FILE", hide = true)]
     pub dump_first_logits: Option<String>,
+
+    /// Offline repack: convert the safetensors model into a TMB (load-optimized)
+    /// binary. Writes <output>.tmb next to the model by default.
+    #[arg(long = "repack", value_name = "FILE", hide = true)]
+    pub repack: Option<String>,
 }
